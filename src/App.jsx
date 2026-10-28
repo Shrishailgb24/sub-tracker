@@ -1,24 +1,30 @@
 import { useState, useEffect } from 'react';
 import {
     PieChart, Pie, Cell, Tooltip, Legend,
-    LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer,
+    BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer,
 } from 'recharts';
 import { ref, onValue, push, set, update, remove } from "firebase/database";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
 import { db, auth, provider } from "./firebase";
 
+// ---------- Constants ----------
+const CATEGORIES = ['Food', 'Rent', 'Transport', 'Entertainment', 'Utilities', 'Shopping', 'Health', 'Other'];
+const CATEGORY_COLORS = {
+    Food: '#2e86ab', Rent: '#0f4c45', Transport: '#7b5ea7', Entertainment: '#d16ba5',
+    Utilities: '#4c9f70', Shopping: '#c9822b', Health: '#c23b2e', Other: '#7a8b87',
+};
+const QUICK_PICKS = ['Netflix', 'Spotify', 'Amazon Prime', 'YouTube Premium', 'JioHotstar', 'ChatGPT Plus'];
+const MARK_COLORS = ['#0f4c45', '#2e86ab', '#7b5ea7', '#c9822b', '#d16ba5', '#4c9f70', '#1f4e79'];
+
 // ---------- Helpers ----------
 const currencyFormatter = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
 const formatINR = (value) => currencyFormatter.format(Math.round(Number(value || 0)));
 
-const CATEGORIES = ['Food', 'Rent', 'Transport', 'Entertainment', 'Utilities', 'Shopping', 'Health', 'Other'];
-const pieColors = ['#2563eb', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#64748b'];
-
 // Local dates (not UTC) so "today" is correct in India before 5:30 AM too
 const toLocalISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const todayISO = () => toLocalISO(new Date());
-const parseLocalDate = (dateString) => {
-    const [y, m, d] = dateString.split('-').map(Number);
+const parseLocalDate = (s) => {
+    const [y, m, d] = s.split('-').map(Number);
     return new Date(y, m - 1, d);
 };
 const startOfToday = () => {
@@ -26,26 +32,21 @@ const startOfToday = () => {
     t.setHours(0, 0, 0, 0);
     return t;
 };
-const prettyDate = (dateString) =>
-    dateString ? parseLocalDate(dateString).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
-
-const monthKey = (dateString) => (dateString || todayISO()).slice(0, 7); // "YYYY-MM"
-const monthLabel = (key) => {
-    const [year, month] = key.split('-').map(Number);
-    const name = new Date(year, month - 1, 1).toLocaleString('en-IN', { month: 'short' });
-    return `${name} '${String(year).slice(2)}`;
+const prettyDate = (date) => date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+const monthKey = (s) => (s || todayISO()).slice(0, 7);
+const monthShort = (key) => {
+    const [y, m] = key.split('-').map(Number);
+    return new Date(y, m - 1, 1).toLocaleString('en-IN', { month: 'short' });
 };
 const lastNMonths = (n) => {
-    const keys = [];
     const d = new Date();
-    for (let i = n - 1; i >= 0; i--) {
-        const m = new Date(d.getFullYear(), d.getMonth() - i, 1);
-        keys.push(`${m.getFullYear()}-${String(m.getMonth() + 1).padStart(2, '0')}`);
-    }
-    return keys;
+    return Array.from({ length: n }, (_, i) => {
+        const m = new Date(d.getFullYear(), d.getMonth() - (n - 1 - i), 1);
+        return `${m.getFullYear()}-${String(m.getMonth() + 1).padStart(2, '0')}`;
+    });
 };
 
-// Adds months without overflowing (e.g. 31 Jan + 1 month = 28/29 Feb)
+// Adds months without overflowing (31 Jan + 1 month = 28/29 Feb)
 const addMonths = (date, months) => {
     const target = new Date(date.getFullYear(), date.getMonth() + months, 1);
     const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
@@ -57,59 +58,217 @@ const addMonths = (date, months) => {
 const nextRenewalDate = (sub) => {
     if (!sub.nextRenewalDate) return null;
     let date = parseLocalDate(sub.nextRenewalDate);
-    if (sub.isFreeTrial) return date; // a trial ends once; it doesn't repeat
+    if (sub.isFreeTrial) return date; // a trial ends once
     const step = sub.cycle === 'yearly' ? 12 : 1;
     const today = startOfToday();
-    let guard = 0;
-    while (date < today && guard < 600) {
-        date = addMonths(date, step);
-        guard++;
-    }
+    for (let i = 0; date < today && i < 600; i++) date = addMonths(date, step);
     return date;
 };
-const daysUntilDate = (date) => (date ? Math.round((date - startOfToday()) / (1000 * 60 * 60 * 24)) : null);
+const daysUntil = (date) => (date ? Math.round((date - startOfToday()) / 86400000) : null);
 const monthlyCostOf = (sub) => (sub.isFreeTrial ? 0 : sub.cycle === 'yearly' ? Number(sub.cost || 0) / 12 : Number(sub.cost || 0));
+const whenText = (days) => (days === 0 ? 'Today' : days === 1 ? 'Tomorrow' : `In ${days} days`);
+const markColor = (name = '') => MARK_COLORS[[...name].reduce((a, c) => a + c.charCodeAt(0), 0) % MARK_COLORS.length];
 
 const snapshotToList = (snapshot) => {
     const data = snapshot.val();
     return data ? Object.keys(data).map((key) => ({ id: key, ...data[key] })) : [];
 };
 
-// ---------- Styles ----------
-const font = 'Inter, "Segoe UI", Roboto, Arial, sans-serif';
-const card = { padding: '20px', border: '1px solid #e5e7eb', borderRadius: '12px', background: 'white', color: '#111827', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' };
-const h1 = { margin: 0, fontSize: '28px', fontWeight: 800, color: '#111827' };
-const h2 = { margin: '0 0 14px', fontSize: '19px', fontWeight: 700, color: '#111827' };
-const input = { padding: '10px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '15px', width: '100%', boxSizing: 'border-box', background: 'white', color: '#111827' };
-const labelText = { fontSize: '13px', color: '#6b7280', display: 'block', marginBottom: '4px' };
-const primaryBtn = { padding: '11px', background: '#111827', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '15px', fontWeight: 600 };
-const smallBtn = { padding: '5px 12px', border: '1px solid #d1d5db', background: '#f9fafb', color: '#111827', borderRadius: '6px', cursor: 'pointer', fontSize: '13px' };
-const dangerBtn = { ...smallBtn, border: '1px solid #fecaca', background: '#fef2f2', color: '#b91c1c' };
-const badge = (bg, color = '#111827') => ({ padding: '3px 9px', background: bg, color, borderRadius: '999px', fontSize: '12px', fontWeight: 600 });
-const muted = { fontSize: '14px', color: '#6b7280' };
+const greeting = () => {
+    const h = new Date().getHours();
+    return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+};
 
-function StatTile({ label, value, note, tone = '#111827' }) {
+const authErrorMessage = (code) => {
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return 'The Google window was closed before sign-in finished. Try again when you\'re ready.';
+    if (code === 'auth/popup-blocked') return 'Your browser blocked the Google sign-in window. Allow pop-ups for this site, then try again.';
+    if (code === 'auth/network-request-failed') return 'Couldn\'t reach Google. Check your internet connection and try again.';
+    if (code === 'auth/unauthorized-domain') return 'Sign-in isn\'t enabled for this web address yet. Add it under Firebase → Authentication → Authorized domains.';
+    return `Sign-in didn't work (${code || 'unknown error'}). Please try again.`;
+};
+
+// ---------- Small components ----------
+const Icon = ({ name }) => {
+    const paths = {
+        plus: <path d="M12 5v14M5 12h14" />,
+        edit: <path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3zM14 7l3 3" />,
+        trash: <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" />,
+        download: <path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14" />,
+        logout: <path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10" />,
+        close: <path d="M6 6l12 12M18 6 6 18" />,
+    };
     return (
-        <div style={{ ...card, padding: '16px 18px' }}>
-            <div style={{ fontSize: '13px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.4px' }}>{label}</div>
-            <div style={{ fontSize: '26px', fontWeight: 800, color: tone, margin: '6px 0 2px' }}>{value}</div>
-            {note && <div style={{ fontSize: '13px', color: '#6b7280' }}>{note}</div>}
+        <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            {paths[name]}
+        </svg>
+    );
+};
+
+const BrandMark = ({ className = 'brand-mark' }) => (
+    <svg className={className} viewBox="0 0 40 40" aria-hidden="true">
+        <rect width="40" height="40" rx="12" fill="#0f4c45" />
+        <path d="M28.5 15.5A10 10 0 1 0 30 21" fill="none" stroke="#fff" strokeWidth="3.2" strokeLinecap="round" />
+        <circle cx="29" cy="12.5" r="3.2" fill="#e9a21b" />
+    </svg>
+);
+
+const GoogleG = () => (
+    <svg viewBox="0 0 48 48" width="16" height="16" aria-hidden="true">
+        <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z" />
+        <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z" />
+        <path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-7.9l-6.5 5C9.5 39.6 16.2 44 24 44z" />
+        <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z" />
+    </svg>
+);
+
+// Signature element: one bar per day of the month, renewal days raised in marigold
+function Ribbon({ daysInMonth, today, chargeDays, light = false, monthName }) {
+    const charges = new Set(chargeDays);
+    const todayPos = ((today - 0.5) / daysInMonth) * 100;
+    return (
+        <div className={`ribbon${light ? ' on-light' : ''}`} role="img" aria-label={`${monthName}: ${charges.size} renewal${charges.size === 1 ? '' : 's'} this month, today is day ${today}`}>
+            <div className="ribbon-days">
+                {Array.from({ length: daysInMonth }, (_, i) => {
+                    const day = i + 1;
+                    const isCharge = charges.has(day);
+                    const cls = isCharge ? `charge${day < today ? ' paid' : ''}` : day === today ? 'today' : day < today ? 'past' : '';
+                    return <span key={day} className={`ribbon-day ${cls}`} title={isCharge ? `Renewal on ${day} ${monthName}` : undefined} />;
+                })}
+            </div>
+            <div className="ribbon-scale">
+                <span style={{ visibility: today <= 4 ? 'hidden' : 'visible' }}>1 {monthName}</span>
+                <span className="ribbon-today" style={{ left: `${todayPos}%` }}>Today</span>
+                <span style={{ visibility: today >= daysInMonth - 4 ? 'hidden' : 'visible' }}>{daysInMonth} {monthName}</span>
+            </div>
         </div>
     );
 }
 
+function Modal({ title, onClose, children }) {
+    useEffect(() => {
+        const onKey = (e) => e.key === 'Escape' && onClose();
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [onClose]);
+    return (
+        <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+            <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
+                <div className="panel-head" style={{ marginBottom: 0 }}>
+                    <h2>{title}</h2>
+                    <button className="icon-btn" onClick={onClose} aria-label="Close"><Icon name="close" /></button>
+                </div>
+                {children}
+            </div>
+        </div>
+    );
+}
+
+// ---------- Landing page (signed out) ----------
+function Landing({ onLogin, signingIn, authError }) {
+    const now = new Date();
+    const monthName = now.toLocaleString('en-IN', { month: 'short' });
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    const today = now.getDate();
+    const sample = [
+        { name: 'Netflix', offset: 2, cost: 649 },
+        { name: 'Spotify', offset: 6, cost: 119 },
+        { name: 'Amazon Prime', offset: 11, cost: 1499 },
+    ].map((s) => ({ ...s, date: new Date(now.getFullYear(), now.getMonth(), today + s.offset) }));
+    const chargeDays = [...sample.map((s) => s.date).filter((d) => d.getMonth() === now.getMonth()).map((d) => d.getDate()), 4].filter((d) => d !== today);
+
+    return (
+        <div className="landing">
+            <header className="landing-top">
+                <span className="brand"><BrandMark />Sub-Tracker</span>
+                <button className="btn btn-sm" onClick={onLogin} disabled={signingIn}>Sign in</button>
+            </header>
+
+            <main>
+                <section className="landing-hero">
+                    <div>
+                        <h1>See every renewal before it charges you.</h1>
+                        <p className="landing-lede">
+                            Sub-Tracker keeps your subscriptions and daily spending in one place, forecasts where your month will end, and warns you while there's still time to change it.
+                        </p>
+                        <div className="landing-cta">
+                            <button className="btn google-btn" onClick={onLogin} disabled={signingIn}>
+                                {signingIn ? <span className="spinner" /> : <span className="g"><GoogleG /></span>}
+                                {signingIn ? 'Waiting for Google…' : 'Continue with Google'}
+                            </button>
+                            {authError ? (
+                                <p className="auth-error" role="alert">{authError}</p>
+                            ) : (
+                                <p className="fine">Free to use. Your data is private to your Google account.</p>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="preview" aria-label="Example of the Sub-Tracker dashboard">
+                        <div className="preview-head">
+                            <h2>{now.toLocaleString('en-IN', { month: 'long' })} so far</h2>
+                            <span className="sub">Example</span>
+                        </div>
+                        <div className="preview-big num">₹14,280</div>
+                        <div className="sub">On track for ₹19,640 of your ₹20,000 budget</div>
+                        <Ribbon daysInMonth={daysInMonth} today={today} chargeDays={chargeDays} monthName={monthName} />
+                        <div className="preview-list">
+                            {sample.map((s) => (
+                                <div className="preview-row" key={s.name}>
+                                    <span><strong>{s.name}</strong> <span className="when">{whenText(s.offset)}</span></span>
+                                    <span className="num">{formatINR(s.cost)}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </section>
+
+                <section className="points">
+                    <div>
+                        <h3>Renewal alerts</h3>
+                        <p>See what renews in the next 7 days and catch free trials before they turn into charges.</p>
+                    </div>
+                    <div>
+                        <h3>Month-end forecast</h3>
+                        <p>Your spending pace projected to the end of the month, with a warning while you can still adjust.</p>
+                    </div>
+                    <div>
+                        <h3>Category budgets</h3>
+                        <p>Set limits for food, rent, transport and more, and watch each one fill up as you spend.</p>
+                    </div>
+                </section>
+            </main>
+
+            <footer className="landing-foot">
+                <span>Built with React and Firebase by Shrishail G Biradar</span>
+                <a href="https://github.com/Shrishailgb24/sub-tracker" target="_blank" rel="noreferrer">View the code on GitHub</a>
+            </footer>
+        </div>
+    );
+}
+
+// ---------- App ----------
 function App() {
-    // --- AUTH ---
+    // Auth
     const [user, setUser] = useState(null);
     const [authLoading, setAuthLoading] = useState(true);
+    const [signingIn, setSigningIn] = useState(false);
+    const [authError, setAuthError] = useState('');
 
-    // --- DATA ---
+    // Data
     const [subscriptions, setSubscriptions] = useState([]);
     const [expenses, setExpenses] = useState([]);
     const [monthlyBudget, setMonthlyBudget] = useState(20000);
     const [categoryBudgets, setCategoryBudgets] = useState({});
 
-    // --- SUBSCRIPTION FORM ---
+    // UI
+    const [modal, setModal] = useState(null); // 'sub' | 'exp' | null
+    const [toast, setToast] = useState(null); // { message, undo }
+    const [editingBudget, setEditingBudget] = useState(false);
+    const [budgetDraft, setBudgetDraft] = useState('');
+    const [editingLimits, setEditingLimits] = useState(false);
+    const [formError, setFormError] = useState('');
+
+    // Subscription form
     const [subName, setSubName] = useState('');
     const [subCost, setSubCost] = useState('');
     const [subCycle, setSubCycle] = useState('monthly');
@@ -117,25 +276,24 @@ function App() {
     const [subIsFreeTrial, setSubIsFreeTrial] = useState(false);
     const [editingSubId, setEditingSubId] = useState(null);
 
-    // --- EXPENSE FORM ---
+    // Expense form
     const [expName, setExpName] = useState('');
     const [expAmount, setExpAmount] = useState('');
     const [expCategory, setExpCategory] = useState('Food');
     const [expDate, setExpDate] = useState(todayISO());
     const [editingExpId, setEditingExpId] = useState(null);
 
-    // --- EXPENSE FILTERS ---
+    // Expense filters
     const [search, setSearch] = useState('');
     const [filterCategory, setFilterCategory] = useState('All');
     const [filterMonth, setFilterMonth] = useState('current');
 
-    // --- LOGIN STATUS ---
+    // --- Login status ---
     useEffect(() => {
         const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
             setUser(currentUser);
             setAuthLoading(false);
             if (!currentUser) {
-                // Clear the previous user's data on sign-out
                 setSubscriptions([]);
                 setExpenses([]);
                 setCategoryBudgets({});
@@ -145,7 +303,7 @@ function App() {
         return () => unsubscribe();
     }, []);
 
-    // --- LIVE SYNC FOR THE SIGNED-IN USER ---
+    // --- Live sync for the signed-in user ---
     useEffect(() => {
         if (!user) return;
         const base = `users/${user.uid}`;
@@ -159,288 +317,405 @@ function App() {
         return () => { unsubSubs(); unsubExps(); unsubSettings(); };
     }, [user]);
 
-    // --- CALCULATIONS (CURRENT MONTH) ---
+    // --- Toast auto-hide ---
+    useEffect(() => {
+        if (!toast) return;
+        const timer = setTimeout(() => setToast(null), 6000);
+        return () => clearTimeout(timer);
+    }, [toast]);
+
+    // --- Calculations (current month) ---
     const now = new Date();
+    const monthName = now.toLocaleString('en-IN', { month: 'short' });
     const currentMonth = monthKey(todayISO());
     const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
     const dayOfMonth = now.getDate();
 
     const thisMonthExpenses = expenses.filter((e) => monthKey(e.date) === currentMonth);
     const monthlySubscriptions = subscriptions.reduce((t, s) => t + monthlyCostOf(s), 0);
-    const yearlySubscriptions = monthlySubscriptions * 12;
     const totalExpensesThisMonth = thisMonthExpenses.reduce((t, e) => t + Number(e.amount || 0), 0);
     const spentThisMonth = monthlySubscriptions + totalExpensesThisMonth;
-
-    // Subscriptions are a fixed monthly cost; only day-to-day expenses are projected forward.
     const projectedSpend = monthlySubscriptions + (totalExpensesThisMonth / dayOfMonth) * daysInMonth;
     const overBudgetBy = projectedSpend - monthlyBudget;
     const budgetLeft = monthlyBudget - spentThisMonth;
+    const meterMax = Math.max(monthlyBudget, projectedSpend, 1);
 
-    const spentByCategory = CATEGORIES.reduce((acc, c) => ({ ...acc, [c]: 0 }), {});
+    const spentByCategory = Object.fromEntries(CATEGORIES.map((c) => [c, 0]));
     thisMonthExpenses.forEach((e) => {
         const c = CATEGORIES.includes(e.category) ? e.category : 'Other';
         spentByCategory[c] += Number(e.amount || 0);
     });
-    const pieData = Object.entries(spentByCategory)
-        .map(([name, value]) => ({ name, value }))
-        .filter((d) => d.value > 0);
+    const pieData = CATEGORIES.map((name) => ({ name, value: spentByCategory[name] })).filter((d) => d.value > 0);
 
     const trendData = lastNMonths(6).map((key) => ({
-        month: monthLabel(key),
-        Expenses: expenses.filter((e) => monthKey(e.date) === key).reduce((t, e) => t + Number(e.amount || 0), 0),
+        key,
+        month: monthShort(key),
+        Spent: expenses.filter((e) => monthKey(e.date) === key).reduce((t, e) => t + Number(e.amount || 0), 0),
     }));
 
     const subsWithRenewal = subscriptions
         .map((s) => {
             const next = nextRenewalDate(s);
-            return { ...s, next, days: daysUntilDate(next) };
+            return { ...s, next, days: daysUntil(next) };
         })
         .sort((a, b) => (a.days ?? Infinity) - (b.days ?? Infinity));
-    const upcomingRenewals = subsWithRenewal.filter((s) => s.days !== null && s.days >= 0 && s.days <= 7);
+    const upcoming = subsWithRenewal.filter((s) => s.days !== null && s.days >= 0 && s.days <= 7);
+    const inThisMonth = (d) => d && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+    const chargeDaysThisMonth = subsWithRenewal.flatMap((s) => {
+        if (!s.next) return [];
+        if (s.isFreeTrial) return inThisMonth(s.next) && s.days >= 0 ? [s.next.getDate()] : [];
+        // This month's billing date: the next renewal, or the previous one if it already happened this month
+        const previous = addMonths(s.next, s.cycle === 'yearly' ? -12 : -1);
+        return [s.next, previous].filter(inThisMonth).map((d) => d.getDate());
+    });
 
-    const filteredExpenses = [...expenses]
+    const filteredExpenses = expenses
         .filter((e) => filterMonth === 'all' || monthKey(e.date) === currentMonth)
         .filter((e) => filterCategory === 'All' || (e.category || 'Other') === filterCategory)
         .filter((e) => (e.name || '').toLowerCase().includes(search.trim().toLowerCase()))
         .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
     const filteredTotal = filteredExpenses.reduce((t, e) => t + Number(e.amount || 0), 0);
 
-    // --- AUTH ACTIONS ---
+    // --- Auth actions ---
     const handleLogin = async () => {
+        setAuthError('');
+        setSigningIn(true);
         try {
             await signInWithPopup(auth, provider);
         } catch (error) {
             console.error('Login Error:', error);
-            window.alert('Failed to log in. Please try again.');
+            setAuthError(authErrorMessage(error?.code));
+        } finally {
+            setSigningIn(false);
         }
     };
     const handleLogout = () => signOut(auth);
 
-    // --- SETTINGS ---
-    const saveMonthlyBudget = (value) => {
+    // --- Settings ---
+    const saveBudget = async () => {
+        const value = Number(budgetDraft);
+        if (!value || value <= 0) return;
         setMonthlyBudget(value);
-        set(ref(db, `users/${user.uid}/settings/monthlyBudget`), value);
+        setEditingBudget(false);
+        await set(ref(db, `users/${user.uid}/settings/monthlyBudget`), value);
+        setToast({ message: `Budget set to ${formatINR(value)}` });
     };
     const saveCategoryBudget = (category, value) => {
         setCategoryBudgets((prev) => ({ ...prev, [category]: value }));
         set(ref(db, `users/${user.uid}/settings/categoryBudgets/${category}`), value);
     };
 
-    // --- SUBSCRIPTIONS: CREATE / UPDATE / DELETE ---
-    const resetSubForm = () => {
-        setSubName(''); setSubCost(''); setSubCycle('monthly'); setSubRenewalDate(''); setSubIsFreeTrial(false); setEditingSubId(null);
+    // --- Subscriptions ---
+    const openNewSubscription = () => {
+        setEditingSubId(null); setSubName(''); setSubCost(''); setSubCycle('monthly'); setSubRenewalDate(''); setSubIsFreeTrial(false);
+        setFormError(''); setModal('sub');
     };
+    const openEditSubscription = (sub) => {
+        setEditingSubId(sub.id); setSubName(sub.name || ''); setSubCost(String(sub.cost ?? '')); setSubCycle(sub.cycle || 'monthly');
+        setSubRenewalDate(sub.nextRenewalDate || ''); setSubIsFreeTrial(Boolean(sub.isFreeTrial));
+        setFormError(''); setModal('sub');
+    };
+    const closeModal = () => { setModal(null); setEditingSubId(null); setEditingExpId(null); };
 
     const handleSubscriptionSubmit = async (e) => {
         e.preventDefault();
-        if (!subName.trim()) return window.alert('Please enter a subscription name.');
-        if (subCost === '' || Number(subCost) < 0) return window.alert('Please enter a valid cost.');
-        if (!subRenewalDate) return window.alert('Please choose the next renewal date.');
+        if (!subName.trim()) return setFormError('Add a name, for example Netflix.');
+        if (subCost === '' || Number(subCost) < 0) return setFormError('Add the price you pay each billing cycle.');
+        if (!subRenewalDate) return setFormError(subIsFreeTrial ? 'Add the date your free trial ends.' : 'Add the date it next renews.');
 
         const data = { name: subName.trim(), cost: Number(subCost), cycle: subCycle, nextRenewalDate: subRenewalDate, isFreeTrial: subIsFreeTrial };
         try {
-            if (editingSubId) {
-                await update(ref(db, `users/${user.uid}/subscriptions/${editingSubId}`), data);
-            } else {
-                await set(push(ref(db, `users/${user.uid}/subscriptions`)), data);
-            }
-            resetSubForm();
+            if (editingSubId) await update(ref(db, `users/${user.uid}/subscriptions/${editingSubId}`), data);
+            else await set(push(ref(db, `users/${user.uid}/subscriptions`)), data);
+            setToast({ message: editingSubId ? `${data.name} updated` : `${data.name} added` });
+            closeModal();
         } catch (error) {
             console.error('Error saving subscription:', error);
-            window.alert('Could not save the subscription. Please try again.');
+            setFormError('Couldn\'t save. Check your connection and try again.');
         }
     };
 
-    const startEditSubscription = (sub) => {
-        setEditingSubId(sub.id);
-        setSubName(sub.name || '');
-        setSubCost(String(sub.cost ?? ''));
-        setSubCycle(sub.cycle || 'monthly');
-        setSubRenewalDate(sub.nextRenewalDate || '');
-        setSubIsFreeTrial(Boolean(sub.isFreeTrial));
-    };
-
     const deleteSubscription = async (sub) => {
-        if (!window.confirm(`Delete subscription "${sub.name}"?`)) return;
-        await remove(ref(db, `users/${user.uid}/subscriptions/${sub.id}`));
-        if (editingSubId === sub.id) resetSubForm();
+        const { id, name, cost, cycle, nextRenewalDate: renewal, isFreeTrial } = sub;
+        const path = `users/${user.uid}/subscriptions/${id}`;
+        await remove(ref(db, path));
+        setToast({ message: `${name} deleted`, undo: () => set(ref(db, path), { name, cost, cycle: cycle || 'monthly', nextRenewalDate: renewal || '', isFreeTrial: Boolean(isFreeTrial) }) });
     };
 
-    // --- EXPENSES: CREATE / UPDATE / DELETE ---
-    const resetExpForm = () => {
-        setExpName(''); setExpAmount(''); setExpCategory('Food'); setExpDate(todayISO()); setEditingExpId(null);
+    // --- Expenses ---
+    const openNewExpense = () => {
+        setEditingExpId(null); setExpName(''); setExpAmount(''); setExpCategory('Food'); setExpDate(todayISO());
+        setFormError(''); setModal('exp');
+    };
+    const openEditExpense = (exp) => {
+        setEditingExpId(exp.id); setExpName(exp.name || ''); setExpAmount(String(exp.amount ?? ''));
+        setExpCategory(CATEGORIES.includes(exp.category) ? exp.category : 'Other'); setExpDate(exp.date || todayISO());
+        setFormError(''); setModal('exp');
     };
 
     const handleExpenseSubmit = async (e) => {
         e.preventDefault();
-        if (!expName.trim()) return window.alert('Please enter an expense name.');
-        if (!expAmount || Number(expAmount) <= 0) return window.alert('Please enter an amount greater than zero.');
+        if (!expName.trim()) return setFormError('Add what you spent on, for example Groceries.');
+        if (!expAmount || Number(expAmount) <= 0) return setFormError('Add an amount greater than zero.');
 
         const data = { name: expName.trim(), amount: Number(expAmount), category: expCategory, date: expDate || todayISO() };
         try {
-            if (editingExpId) {
-                await update(ref(db, `users/${user.uid}/expenses/${editingExpId}`), data);
-            } else {
-                await set(push(ref(db, `users/${user.uid}/expenses`)), data);
-            }
-            resetExpForm();
+            if (editingExpId) await update(ref(db, `users/${user.uid}/expenses/${editingExpId}`), data);
+            else await set(push(ref(db, `users/${user.uid}/expenses`)), data);
+            setToast({ message: editingExpId ? 'Expense updated' : `${formatINR(data.amount)} added to ${data.category}` });
+            closeModal();
         } catch (error) {
             console.error('Error saving expense:', error);
-            window.alert('Could not save the expense. Please try again.');
+            setFormError('Couldn\'t save. Check your connection and try again.');
         }
     };
 
-    const startEditExpense = (exp) => {
-        setEditingExpId(exp.id);
-        setExpName(exp.name || '');
-        setExpAmount(String(exp.amount ?? ''));
-        setExpCategory(CATEGORIES.includes(exp.category) ? exp.category : 'Other');
-        setExpDate(exp.date || todayISO());
-    };
-
     const deleteExpense = async (exp) => {
-        if (!window.confirm(`Delete expense "${exp.name}"?`)) return;
-        await remove(ref(db, `users/${user.uid}/expenses/${exp.id}`));
-        if (editingExpId === exp.id) resetExpForm();
+        const { id, name, amount, category, date } = exp;
+        const path = `users/${user.uid}/expenses/${id}`;
+        await remove(ref(db, path));
+        setToast({ message: `${name} deleted`, undo: () => set(ref(db, path), { name, amount, category: category || 'Other', date: date || todayISO() }) });
     };
 
-    // --- CSV EXPORT ---
+    // --- CSV export ---
     const exportCSV = () => {
         const escape = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
         const rows = [
             ['Type', 'Name', 'Category / Billing', 'Amount (INR)', 'Date'],
             ...[...expenses].sort((a, b) => (b.date || '').localeCompare(a.date || '')).map((e) => ['Expense', e.name, e.category, e.amount, e.date || '']),
-            ...subscriptions.map((s) => ['Subscription', s.name, s.isFreeTrial ? 'Free Trial' : (s.cycle === 'yearly' ? 'Yearly' : 'Monthly'), s.cost, s.nextRenewalDate || '']),
+            ...subscriptions.map((s) => ['Subscription', s.name, s.isFreeTrial ? 'Free trial' : (s.cycle === 'yearly' ? 'Yearly' : 'Monthly'), s.cost, s.nextRenewalDate || '']),
         ];
         const csv = rows.map((r) => r.map(escape).join(',')).join('\n');
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
         const link = document.createElement('a');
         link.href = url;
         link.download = `sub-tracker-${todayISO()}.csv`;
         link.click();
         URL.revokeObjectURL(url);
+        setToast({ message: 'CSV downloaded' });
     };
 
-    // --- UI: LOADING ---
+    // ---------- Screens ----------
     if (authLoading) {
-        return <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: font, color: '#6b7280' }}>Loading...</div>;
-    }
-
-    // --- UI: LOGIN SCREEN ---
-    if (!user) {
         return (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', fontFamily: font, backgroundColor: '#f3f4f6', padding: '16px' }}>
-                <div style={{ ...card, padding: '40px', textAlign: 'center', maxWidth: '440px' }}>
-                    <h1 style={h1}>Sub-Tracker</h1>
-                    <p style={{ color: '#4b5563', margin: '12px 0 20px', lineHeight: 1.5 }}>
-                        Track your subscriptions and daily expenses, forecast your month-end spend, and get warned before you go over budget.
-                    </p>
-                    <ul style={{ textAlign: 'left', color: '#374151', margin: '0 0 24px', paddingLeft: '20px', lineHeight: 1.8, fontSize: '15px' }}>
-                        <li>Renewal reminders before you get charged</li>
-                        <li>Category budgets and spending charts</li>
-                        <li>Private, real-time sync across your devices</li>
-                    </ul>
-                    <button onClick={handleLogin} style={{ ...primaryBtn, background: '#2563eb', padding: '12px 24px', fontSize: '16px' }}>
-                        Sign in with Google
-                    </button>
-                </div>
+            <div className="splash" role="status">
+                <BrandMark />
+                <span>Opening Sub-Tracker…</span>
             </div>
         );
     }
 
-    // --- UI: DASHBOARD ---
+    if (!user) return <Landing onLogin={handleLogin} signingIn={signingIn} authError={authError} />;
+
+    const firstName = (user.displayName || user.email || '').split(/[ @]/)[0];
+
     return (
-        <div style={{ background: '#f3f4f6', minHeight: '100vh', fontFamily: font }}>
-            <div style={{ padding: '24px 16px', maxWidth: '1200px', margin: '0 auto', color: '#111827' }}>
-
-                {/* Header */}
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '20px' }}>
-                    <div>
-                        <h1 style={h1}>Sub-Tracker</h1>
-                        <div style={muted}>{now.toLocaleString('en-IN', { month: 'long', year: 'numeric' })} overview</div>
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                        <span style={muted}>{user.email}</span>
-                        <button onClick={exportCSV} style={smallBtn}>Export CSV</button>
-                        <button onClick={handleLogout} style={dangerBtn}>Log Out</button>
-                    </div>
+        <div className="app">
+            {/* Top bar */}
+            <header className="topbar">
+                <span className="brand"><BrandMark />Sub-Tracker</span>
+                <div className="topbar-actions">
+                    <button className="btn btn-ghost btn-sm" onClick={exportCSV}><Icon name="download" />Export CSV</button>
+                    {user.photoURL
+                        ? <img className="avatar" src={user.photoURL} alt="" referrerPolicy="no-referrer" />
+                        : <span className="avatar" aria-hidden="true">{firstName.charAt(0).toUpperCase()}</span>}
+                    <span className="user-name fine">{user.displayName || user.email}</span>
+                    <button className="btn btn-ghost btn-sm" onClick={handleLogout}><Icon name="logout" />Log out</button>
                 </div>
+            </header>
 
-                {/* Stat tiles */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '16px', marginBottom: '16px' }}>
-                    <StatTile label="Spent this month" value={formatINR(spentThisMonth)} note={`${formatINR(totalExpensesThisMonth)} expenses + ${formatINR(monthlySubscriptions)} subscriptions`} />
-                    <StatTile label="Projected month-end" value={formatINR(projectedSpend)} tone={overBudgetBy > 0 ? '#b91c1c' : '#111827'} note={`Budget ${formatINR(monthlyBudget)}`} />
-                    <StatTile label="Budget left" value={formatINR(budgetLeft)} tone={budgetLeft < 0 ? '#b91c1c' : '#047857'} note={`${daysInMonth - dayOfMonth} days left this month`} />
-                    <StatTile label="Subscriptions / year" value={formatINR(yearlySubscriptions)} note={`${subscriptions.filter((s) => !s.isFreeTrial).length} paid, ${subscriptions.filter((s) => s.isFreeTrial).length} free trial`} />
-                </div>
+            <div className="greeting">
+                <h1>{greeting()}, {firstName}</h1>
+                <p>{now.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}. {daysInMonth - dayOfMonth} days left in {now.toLocaleString('en-IN', { month: 'long' })}.</p>
+            </div>
 
-                {/* Budget + category chart */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '16px', marginBottom: '16px' }}>
-                    <div style={card}>
-                        <h2 style={h2}>Budget</h2>
-                        <label style={labelText}>Monthly budget (₹)</label>
-                        <input type="number" min="0" value={monthlyBudget} onChange={(e) => saveMonthlyBudget(Number(e.target.value))} style={input} />
-                        {overBudgetBy > 0 ? (
-                            <div style={{ marginTop: '14px', padding: '12px', border: '1px solid #fca5a5', background: '#fef2f2', color: '#991b1b', borderRadius: '8px', fontWeight: 700 }}>
-                                Early warning: at this rate you'll exceed your budget by {formatINR(overBudgetBy)} this month.
-                            </div>
-                        ) : (
-                            <div style={{ marginTop: '14px', padding: '12px', border: '1px solid #86efac', background: '#f0fdf4', color: '#166534', borderRadius: '8px', fontWeight: 700 }}>
-                                On track: projected {formatINR(-overBudgetBy)} under budget.
-                            </div>
-                        )}
-                        <h3 style={{ fontSize: '15px', fontWeight: 700, margin: '18px 0 8px' }}>Renewing in the next 7 days</h3>
-                        {upcomingRenewals.length === 0 ? (
-                            <div style={muted}>Nothing renews this week.</div>
-                        ) : (
-                            <div style={{ display: 'grid', gap: '6px' }}>
-                                {upcomingRenewals.map((s) => (
-                                    <div key={s.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '14px' }}>
-                                        <span><strong>{s.name}</strong> · {s.days === 0 ? 'today' : `in ${s.days} day${s.days === 1 ? '' : 's'}`}</span>
-                                        <span>{s.isFreeTrial ? 'Trial ends' : formatINR(s.cost)}</span>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
+            <div className="grid">
+                {/* Summary */}
+                <section className="panel summary span-7" aria-label="This month's spending">
+                    <div className="label">Spent in {now.toLocaleString('en-IN', { month: 'long' })} so far</div>
+                    <div className="summary-big num">{formatINR(spentThisMonth)}</div>
+
+                    <div className="meter" aria-hidden="true">
+                        <div className="meter-fill" style={{ width: `${Math.min(100, (spentThisMonth / meterMax) * 100)}%` }} />
+                        {projectedSpend > monthlyBudget && <div className="meter-budget" style={{ left: `${(monthlyBudget / meterMax) * 100}%` }} />}
+                        <div className="meter-proj" style={{ left: `calc(${Math.min(100, (projectedSpend / meterMax) * 100)}% - 1px)` }} />
+                    </div>
+                    <div className="meter-legend">
+                        <span><span className="key" />Projected {formatINR(projectedSpend)}</span>
+                        <span>
+                            Budget {formatINR(monthlyBudget)}{' '}
+                            {!editingBudget && <button className="link-btn" onClick={() => { setBudgetDraft(String(monthlyBudget)); setEditingBudget(true); }}>Change</button>}
+                        </span>
+                    </div>
+                    {editingBudget && (
+                        <form className="budget-edit" onSubmit={(e) => { e.preventDefault(); saveBudget(); }}>
+                            <input type="number" min="1" autoFocus value={budgetDraft} onChange={(e) => setBudgetDraft(e.target.value)} aria-label="Monthly budget in rupees" />
+                            <button className="btn btn-sm" type="submit">Save</button>
+                            <button className="btn btn-sm btn-ghost" type="button" style={{ color: '#fff' }} onClick={() => setEditingBudget(false)}>Cancel</button>
+                        </form>
+                    )}
+
+                    <div className={`forecast ${overBudgetBy > 0 ? 'over' : 'ok'}`}>
+                        {overBudgetBy > 0
+                            ? `At this pace you'll spend ${formatINR(projectedSpend)} by ${daysInMonth} ${monthName}, ${formatINR(overBudgetBy)} over budget. Slow down on day-to-day spending to stay on track.`
+                            : `At this pace you'll finish the month around ${formatINR(projectedSpend)}, ${formatINR(-overBudgetBy)} under budget.`}
                     </div>
 
-                    <div style={card}>
-                        <h2 style={h2}>Spending by Category</h2>
-                        {pieData.length > 0 ? (
-                            <ResponsiveContainer width="100%" height={280}>
+                    <div className="mini-stats">
+                        <div><strong className="num">{formatINR(Math.max(0, budgetLeft))}</strong>{budgetLeft < 0 ? `over by ${formatINR(-budgetLeft)}` : 'left to spend'}</div>
+                        <div><strong className="num">{formatINR(monthlySubscriptions)}</strong>subscriptions a month</div>
+                        <div><strong className="num">{formatINR(monthlySubscriptions * 12)}</strong>subscriptions a year</div>
+                    </div>
+                </section>
+
+                {/* Renewals */}
+                <section className="panel renewals span-5">
+                    <div className="panel-head"><h2>Renewals this month</h2></div>
+                    <Ribbon daysInMonth={daysInMonth} today={dayOfMonth} chargeDays={chargeDaysThisMonth} light monthName={monthName} />
+                    {upcoming.length > 0 ? (
+                        <ul className="renewal-list">
+                            {upcoming.map((s) => (
+                                <li key={s.id}>
+                                    <span><strong>{s.name}</strong><br /><span className="when">{s.isFreeTrial ? 'Free trial ends' : 'Renews'} {whenText(s.days).toLowerCase()}</span></span>
+                                    <span className="num">{s.isFreeTrial ? `then ${formatINR(s.cost)}` : formatINR(s.cost)}</span>
+                                </li>
+                            ))}
+                        </ul>
+                    ) : (
+                        <p className="empty">Nothing renews in the next 7 days.</p>
+                    )}
+                </section>
+
+                {/* Category donut */}
+                <section className="panel span-5">
+                    <div className="panel-head"><h2>Where it went</h2></div>
+                    {pieData.length > 0 ? (
+                        <div className="donut-wrap">
+                            <ResponsiveContainer width="100%" height={270}>
                                 <PieChart>
-                                    <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={60} outerRadius={100} stroke={pieData.length > 1 ? '#fff' : 'none'} strokeWidth={2}>
-                                        {pieData.map((entry) => <Cell key={entry.name} fill={pieColors[CATEGORIES.indexOf(entry.name) % pieColors.length]} />)}
+                                    <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="45%" innerRadius={68} outerRadius={100} stroke={pieData.length > 1 ? '#fff' : 'none'} strokeWidth={3}>
+                                        {pieData.map((d) => <Cell key={d.name} fill={CATEGORY_COLORS[d.name]} />)}
                                     </Pie>
-                                    <Tooltip formatter={(value) => formatINR(value)} />
-                                    <Legend />
+                                    <Tooltip formatter={(v) => formatINR(v)} />
+                                    <Legend iconType="circle" />
                                 </PieChart>
                             </ResponsiveContainer>
-                        ) : (
-                            <div style={{ height: '280px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af' }}>Add expenses to see the chart</div>
-                        )}
-                    </div>
-                </div>
+                            <div className="donut-center"><div><strong className="num">{formatINR(totalExpensesThisMonth)}</strong><span>this month</span></div></div>
+                        </div>
+                    ) : (
+                        <div className="empty-state"><p>Add an expense to see where your money goes.</p><button className="btn btn-primary btn-sm" onClick={openNewExpense}><Icon name="plus" />Add expense</button></div>
+                    )}
+                </section>
 
                 {/* Trend */}
-                <div style={{ ...card, marginBottom: '16px' }}>
-                    <h2 style={h2}>Monthly Spending Trend</h2>
-                    <ResponsiveContainer width="100%" height={260}>
-                        <LineChart data={trendData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                            <XAxis dataKey="month" tick={{ fontSize: 13 }} />
-                            <YAxis tick={{ fontSize: 13 }} tickFormatter={(v) => `₹${v >= 1000 ? `${Math.round(v / 1000)}k` : v}`} />
-                            <Tooltip formatter={(value) => formatINR(value)} />
-                            <Line type="linear" dataKey="Expenses" stroke="#2563eb" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 6 }} />
-                        </LineChart>
+                <section className="panel span-7">
+                    <div className="panel-head"><h2>Last 6 months</h2><span className="fine">Day-to-day expenses</span></div>
+                    <ResponsiveContainer width="100%" height={270}>
+                        <BarChart data={trendData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                            <CartesianGrid vertical={false} stroke="#e8eeeb" />
+                            <XAxis dataKey="month" tickLine={false} axisLine={false} tick={{ fontSize: 13, fill: '#5d6c67' }} />
+                            <YAxis tickLine={false} axisLine={false} width={48} tick={{ fontSize: 13, fill: '#5d6c67' }} tickFormatter={(v) => `₹${v >= 1000 ? `${Math.round(v / 1000)}k` : v}`} />
+                            <Tooltip cursor={{ fill: '#f2f5f3' }} formatter={(v) => formatINR(v)} />
+                            <Bar dataKey="Spent" radius={[8, 8, 0, 0]} maxBarSize={46}>
+                                {trendData.map((d) => <Cell key={d.key} fill={d.key === currentMonth ? '#0f4c45' : '#9fc5bb'} />)}
+                            </Bar>
+                        </BarChart>
                     </ResponsiveContainer>
-                </div>
+                </section>
 
-                {/* Category budgets */}
-                <div style={{ ...card, marginBottom: '16px' }}>
-                    <h2 style={h2}>Category Budgets</h2>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '18px' }}>
+                {/* Subscriptions */}
+                <section className="panel span-6">
+                    <div className="panel-head">
+                        <h2>Subscriptions<span className="count">{subscriptions.length}</span></h2>
+                        <button className="btn btn-primary btn-sm" onClick={openNewSubscription}><Icon name="plus" />Add subscription</button>
+                    </div>
+                    {subsWithRenewal.length === 0 ? (
+                        <div className="empty-state"><p>Add the services you pay for, like Netflix or Spotify, to see when each one renews.</p><button className="btn btn-primary btn-sm" onClick={openNewSubscription}><Icon name="plus" />Add your first subscription</button></div>
+                    ) : (
+                        <ul className="items">
+                            {subsWithRenewal.map((sub) => {
+                                const trialEnded = sub.isFreeTrial && sub.days !== null && sub.days < 0;
+                                return (
+                                    <li key={sub.id} className={`item${editingSubId === sub.id ? ' editing' : ''}`}>
+                                        <span className="item-mark" style={{ background: markColor(sub.name) }} aria-hidden="true">{(sub.name || '?').charAt(0).toUpperCase()}</span>
+                                        <div>
+                                            <div className="item-name">{sub.name}</div>
+                                            <div className="item-meta">
+                                                {sub.next ? <span>{trialEnded ? 'Trial ended' : sub.isFreeTrial ? 'Trial ends' : 'Renews'} {prettyDate(sub.next)}</span> : <span>No renewal date</span>}
+                                                {sub.isFreeTrial && !trialEnded && <span className="chip">Free trial</span>}
+                                                {sub.days !== null && sub.days >= 0 && sub.days <= 7 && <span className="chip soon">{whenText(sub.days)}</span>}
+                                                {trialEnded && <span className="chip alert">Trial ended</span>}
+                                            </div>
+                                        </div>
+                                        <div className="item-right">
+                                            <div className="item-amt num">{formatINR(sub.cost)}<small>/{sub.cycle === 'yearly' ? 'yr' : 'mo'}</small></div>
+                                            <div className="item-actions">
+                                                <button className="icon-btn" onClick={() => openEditSubscription(sub)} aria-label={`Edit ${sub.name}`}><Icon name="edit" /></button>
+                                                <button className="icon-btn danger" onClick={() => deleteSubscription(sub)} aria-label={`Delete ${sub.name}`}><Icon name="trash" /></button>
+                                            </div>
+                                        </div>
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    )}
+                </section>
+
+                {/* Expenses */}
+                <section className="panel span-6">
+                    <div className="panel-head">
+                        <h2>Expenses<span className="count">{expenses.length}</span></h2>
+                        <button className="btn btn-primary btn-sm" onClick={openNewExpense}><Icon name="plus" />Add expense</button>
+                    </div>
+                    {expenses.length === 0 ? (
+                        <div className="empty-state"><p>Log what you spend day to day, like groceries, rent or travel, to see your month-end forecast.</p><button className="btn btn-primary btn-sm" onClick={openNewExpense}><Icon name="plus" />Add your first expense</button></div>
+                    ) : (
+                        <>
+                            <div className="filters">
+                                <input className="input input-sm" type="search" placeholder="Search expenses" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search expenses" />
+                                <select className="input input-sm" value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} aria-label="Filter by category">
+                                    <option value="All">All categories</option>
+                                    {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                                </select>
+                                <select className="input input-sm" value={filterMonth} onChange={(e) => setFilterMonth(e.target.value)} aria-label="Filter by month">
+                                    <option value="current">This month</option>
+                                    <option value="all">All time</option>
+                                </select>
+                            </div>
+                            <div className="list-total">{filteredExpenses.length} {filteredExpenses.length === 1 ? 'expense' : 'expenses'}, {formatINR(filteredTotal)} in total</div>
+                            {filteredExpenses.length === 0 ? (
+                                <p className="empty">No expenses match these filters.</p>
+                            ) : (
+                                <ul className="items">
+                                    {filteredExpenses.map((exp) => (
+                                        <li key={exp.id} className={`item${editingExpId === exp.id ? ' editing' : ''}`}>
+                                            <span className="item-mark" style={{ background: CATEGORY_COLORS[exp.category] || CATEGORY_COLORS.Other }} aria-hidden="true">{(exp.category || 'O').charAt(0)}</span>
+                                            <div>
+                                                <div className="item-name">{exp.name}</div>
+                                                <div className="item-meta"><span>{exp.category || 'Other'}{exp.date ? `, ${prettyDate(parseLocalDate(exp.date))}` : ''}</span></div>
+                                            </div>
+                                            <div className="item-right">
+                                                <div className="item-amt num">{formatINR(exp.amount)}</div>
+                                                <div className="item-actions">
+                                                    <button className="icon-btn" onClick={() => openEditExpense(exp)} aria-label={`Edit ${exp.name}`}><Icon name="edit" /></button>
+                                                    <button className="icon-btn danger" onClick={() => deleteExpense(exp)} aria-label={`Delete ${exp.name}`}><Icon name="trash" /></button>
+                                                </div>
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </>
+                    )}
+                </section>
+
+                {/* Category limits */}
+                <section className="panel span-12">
+                    <div className="panel-head">
+                        <h2>Category budgets</h2>
+                        <button className="btn btn-sm" onClick={() => setEditingLimits(!editingLimits)}>{editingLimits ? 'Done' : 'Set limits'}</button>
+                    </div>
+                    <div className="limits">
                         {CATEGORIES.map((c) => {
                             const limit = Number(categoryBudgets[c] || 0);
                             const spent = spentByCategory[c] || 0;
@@ -448,129 +723,108 @@ function App() {
                             const over = limit > 0 && spent > limit;
                             return (
                                 <div key={c}>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px', fontSize: '15px' }}>
+                                    <div className="limit-top">
                                         <strong>{c}</strong>
-                                        <span style={{ color: over ? '#b91c1c' : '#4b5563' }}>{formatINR(spent)}{limit > 0 && ` / ${formatINR(limit)}`}</span>
+                                        <span className={`amt num${over ? ' over' : ''}`}>{formatINR(spent)}{limit > 0 ? ` of ${formatINR(limit)}` : ''}</span>
                                     </div>
-                                    <div style={{ height: '8px', background: '#e5e7eb', borderRadius: '999px', overflow: 'hidden', marginBottom: '8px' }}>
-                                        <div style={{ width: `${pct}%`, height: '100%', background: over ? '#dc2626' : pct > 80 ? '#f59e0b' : '#10b981' }} />
-                                    </div>
-                                    <input type="number" min="0" placeholder="Set monthly limit (₹)" value={categoryBudgets[c] ?? ''} onChange={(e) => saveCategoryBudget(c, e.target.value === '' ? null : Number(e.target.value))} style={{ ...input, padding: '8px', fontSize: '14px' }} />
-                                    {over && <div style={{ color: '#b91c1c', fontSize: '13px', marginTop: '4px' }}>Over limit by {formatINR(spent - limit)}</div>}
+                                    <div className="bar"><span style={{ width: `${pct}%`, background: over ? '#c23b2e' : pct > 80 ? '#e9a21b' : CATEGORY_COLORS[c] }} /></div>
+                                    {over && <div className="limit-note">{formatINR(spent - limit)} over this limit</div>}
+                                    {editingLimits && (
+                                        <input className="input input-sm limit-input" type="number" min="0" placeholder="No limit" aria-label={`${c} monthly limit in rupees`}
+                                            value={categoryBudgets[c] ?? ''} onChange={(e) => saveCategoryBudget(c, e.target.value === '' ? null : Number(e.target.value))} />
+                                    )}
                                 </div>
                             );
                         })}
                     </div>
-                </div>
-
-                {/* Lists */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '16px' }}>
-                    <section style={card}>
-                        <h2 style={h2}>Subscriptions</h2>
-                        <form onSubmit={handleSubscriptionSubmit} style={{ display: 'grid', gap: '10px', marginBottom: '16px' }}>
-                            <input type="text" placeholder="Subscription name (e.g. Netflix)" value={subName} onChange={(e) => setSubName(e.target.value)} style={input} />
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                                <input type="number" min="0" placeholder="Cost (₹)" value={subCost} onChange={(e) => setSubCost(e.target.value)} style={input} />
-                                <select value={subCycle} onChange={(e) => setSubCycle(e.target.value)} style={input}>
-                                    <option value="monthly">Monthly</option>
-                                    <option value="yearly">Yearly</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label style={labelText}>{subIsFreeTrial ? 'Trial end date' : 'Next renewal date'}</label>
-                                <input type="date" value={subRenewalDate} onChange={(e) => setSubRenewalDate(e.target.value)} style={input} />
-                            </div>
-                            <label style={{ fontSize: '15px' }}><input type="checkbox" checked={subIsFreeTrial} onChange={(e) => setSubIsFreeTrial(e.target.checked)} /> Free trial</label>
-                            <div style={{ display: 'flex', gap: '8px' }}>
-                                <button type="submit" style={{ ...primaryBtn, flex: 1 }}>{editingSubId ? 'Save Changes' : 'Add Subscription'}</button>
-                                {editingSubId && <button type="button" onClick={resetSubForm} style={smallBtn}>Cancel</button>}
-                            </div>
-                        </form>
-                        <div style={{ display: 'grid', gap: '10px' }}>
-                            {subsWithRenewal.map((sub) => {
-                                const trialEnded = sub.isFreeTrial && sub.days !== null && sub.days < 0;
-                                return (
-                                    <div key={sub.id} style={{ padding: '12px 14px', border: editingSubId === sub.id ? '2px solid #2563eb' : '1px solid #e5e7eb', borderRadius: '10px' }}>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
-                                            <strong style={{ fontSize: '16px' }}>{sub.name}</strong>
-                                            <span style={{ fontWeight: 600 }}>{formatINR(sub.cost)}<span style={muted}>/{sub.cycle === 'yearly' ? 'year' : 'month'}</span></span>
-                                        </div>
-                                        <div style={{ ...muted, marginTop: '2px' }}>
-                                            {sub.next ? `${sub.isFreeTrial ? 'Trial ends' : 'Renews'} ${prettyDate(toLocalISO(sub.next))}` : 'No renewal date (edit to add one)'}
-                                        </div>
-                                        <div style={{ display: 'flex', gap: '6px', marginTop: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-                                            {sub.isFreeTrial && <span style={badge('#eff6ff', '#1d4ed8')}>Free Trial</span>}
-                                            {sub.days !== null && sub.days >= 0 && sub.days <= 7 && (
-                                                <span style={badge('#fef2f2', '#b91c1c')}>{sub.days === 0 ? 'Renews today!' : `${sub.isFreeTrial ? 'Ends' : 'Renews'} in ${sub.days} day${sub.days === 1 ? '' : 's'}`}</span>
-                                            )}
-                                            {trialEnded && <span style={badge('#fff7ed', '#c2410c')}>Trial ended – cancel or mark as paid</span>}
-                                            <span style={{ marginLeft: 'auto', display: 'flex', gap: '6px' }}>
-                                                <button onClick={() => startEditSubscription(sub)} style={smallBtn}>Edit</button>
-                                                <button onClick={() => deleteSubscription(sub)} style={dangerBtn}>Delete</button>
-                                            </span>
-                                        </div>
-                                    </div>
-                                );
-                            })}
-                            {subscriptions.length === 0 && <p style={{ ...muted, textAlign: 'center' }}>No subscriptions yet.</p>}
-                        </div>
-                    </section>
-
-                    <section style={card}>
-                        <h2 style={h2}>Expenses</h2>
-                        <form onSubmit={handleExpenseSubmit} style={{ display: 'grid', gap: '10px', marginBottom: '16px' }}>
-                            <input type="text" placeholder="Expense name (e.g. Groceries)" value={expName} onChange={(e) => setExpName(e.target.value)} style={input} />
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                                <input type="number" min="0" placeholder="Amount (₹)" value={expAmount} onChange={(e) => setExpAmount(e.target.value)} style={input} />
-                                <select value={expCategory} onChange={(e) => setExpCategory(e.target.value)} style={input}>
-                                    {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
-                                </select>
-                            </div>
-                            <input type="date" value={expDate} onChange={(e) => setExpDate(e.target.value)} style={input} />
-                            <div style={{ display: 'flex', gap: '8px' }}>
-                                <button type="submit" style={{ ...primaryBtn, flex: 1 }}>{editingExpId ? 'Save Changes' : 'Add Expense'}</button>
-                                {editingExpId && <button type="button" onClick={resetExpForm} style={smallBtn}>Cancel</button>}
-                            </div>
-                        </form>
-
-                        {/* Filters */}
-                        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '8px', marginBottom: '8px' }}>
-                            <input type="search" placeholder="Search expenses" value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...input, padding: '8px', fontSize: '14px' }} />
-                            <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} style={{ ...input, padding: '8px', fontSize: '14px' }}>
-                                <option value="All">All</option>
-                                {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
-                            </select>
-                            <select value={filterMonth} onChange={(e) => setFilterMonth(e.target.value)} style={{ ...input, padding: '8px', fontSize: '14px' }}>
-                                <option value="current">This month</option>
-                                <option value="all">All time</option>
-                            </select>
-                        </div>
-                        <div style={{ ...muted, marginBottom: '10px' }}>{filteredExpenses.length} expense{filteredExpenses.length === 1 ? '' : 's'} · {formatINR(filteredTotal)}</div>
-
-                        <div style={{ display: 'grid', gap: '10px' }}>
-                            {filteredExpenses.map((exp) => (
-                                <div key={exp.id} style={{ padding: '12px 14px', border: editingExpId === exp.id ? '2px solid #2563eb' : '1px solid #e5e7eb', borderRadius: '10px' }}>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
-                                        <strong style={{ fontSize: '16px' }}>{exp.name}</strong>
-                                        <span style={{ fontWeight: 600 }}>{formatINR(exp.amount)}</span>
-                                    </div>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', gap: '8px' }}>
-                                        <span style={muted}>
-                                            <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: pieColors[Math.max(0, CATEGORIES.indexOf(exp.category))], marginRight: '6px' }} />
-                                            {exp.category}{exp.date ? ` · ${prettyDate(exp.date)}` : ''}
-                                        </span>
-                                        <span style={{ display: 'flex', gap: '6px' }}>
-                                            <button onClick={() => startEditExpense(exp)} style={smallBtn}>Edit</button>
-                                            <button onClick={() => deleteExpense(exp)} style={dangerBtn}>Delete</button>
-                                        </span>
-                                    </div>
-                                </div>
-                            ))}
-                            {filteredExpenses.length === 0 && <p style={{ ...muted, textAlign: 'center' }}>{expenses.length === 0 ? 'No expenses yet.' : 'No expenses match these filters.'}</p>}
-                        </div>
-                    </section>
-                </div>
+                </section>
             </div>
+
+            {/* Subscription form */}
+            {modal === 'sub' && (
+                <Modal title={editingSubId ? 'Edit subscription' : 'Add a subscription'} onClose={closeModal}>
+                    <form onSubmit={handleSubscriptionSubmit} style={{ display: 'grid', gap: '14px' }}>
+                        {!editingSubId && (
+                            <div className="quick-picks" aria-label="Popular services">
+                                {QUICK_PICKS.map((n) => <button type="button" key={n} onClick={() => setSubName(n)}>{n}</button>)}
+                            </div>
+                        )}
+                        <div className="field">
+                            <label htmlFor="sub-name">Name</label>
+                            <input id="sub-name" className="input" autoFocus placeholder="Netflix" value={subName} onChange={(e) => setSubName(e.target.value)} />
+                        </div>
+                        <div className="row-2">
+                            <div className="field">
+                                <label htmlFor="sub-cost">Price (₹)</label>
+                                <input id="sub-cost" className="input" type="number" min="0" inputMode="decimal" placeholder="649" value={subCost} onChange={(e) => setSubCost(e.target.value)} />
+                            </div>
+                            <div className="field">
+                                <label htmlFor="sub-cycle">Billed</label>
+                                <select id="sub-cycle" className="input" value={subCycle} onChange={(e) => setSubCycle(e.target.value)}>
+                                    <option value="monthly">Every month</option>
+                                    <option value="yearly">Every year</option>
+                                </select>
+                            </div>
+                        </div>
+                        <label className="check"><input type="checkbox" checked={subIsFreeTrial} onChange={(e) => setSubIsFreeTrial(e.target.checked)} />I'm on a free trial</label>
+                        <div className="field">
+                            <label htmlFor="sub-date">{subIsFreeTrial ? 'Trial ends on' : 'Next renewal'}</label>
+                            <input id="sub-date" className="input" type="date" value={subRenewalDate} onChange={(e) => setSubRenewalDate(e.target.value)} />
+                        </div>
+                        {formError && <p className="form-error" role="alert">{formError}</p>}
+                        <div className="modal-actions">
+                            <button type="button" className="btn" onClick={closeModal}>Cancel</button>
+                            <button type="submit" className="btn btn-primary">{editingSubId ? 'Save changes' : 'Add subscription'}</button>
+                        </div>
+                    </form>
+                </Modal>
+            )}
+
+            {/* Expense form */}
+            {modal === 'exp' && (
+                <Modal title={editingExpId ? 'Edit expense' : 'Add an expense'} onClose={closeModal}>
+                    <form onSubmit={handleExpenseSubmit} style={{ display: 'grid', gap: '14px' }}>
+                        <div className="field">
+                            <label htmlFor="exp-name">What did you spend on?</label>
+                            <input id="exp-name" className="input" autoFocus placeholder="Groceries" value={expName} onChange={(e) => setExpName(e.target.value)} />
+                        </div>
+                        <div className="row-2">
+                            <div className="field">
+                                <label htmlFor="exp-amount">Amount (₹)</label>
+                                <input id="exp-amount" className="input" type="number" min="0" inputMode="decimal" placeholder="450" value={expAmount} onChange={(e) => setExpAmount(e.target.value)} />
+                            </div>
+                            <div className="field">
+                                <label htmlFor="exp-date">Date</label>
+                                <input id="exp-date" className="input" type="date" value={expDate} onChange={(e) => setExpDate(e.target.value)} />
+                            </div>
+                        </div>
+                        <div className="field">
+                            <label>Category</label>
+                            <div className="quick-picks" role="radiogroup" aria-label="Category">
+                                {CATEGORIES.map((c) => (
+                                    <button type="button" key={c} role="radio" aria-checked={expCategory === c} onClick={() => setExpCategory(c)}
+                                        style={expCategory === c ? { background: CATEGORY_COLORS[c], borderColor: CATEGORY_COLORS[c], color: '#fff' } : undefined}>
+                                        {c}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        {formError && <p className="form-error" role="alert">{formError}</p>}
+                        <div className="modal-actions">
+                            <button type="button" className="btn" onClick={closeModal}>Cancel</button>
+                            <button type="submit" className="btn btn-primary">{editingExpId ? 'Save changes' : 'Add expense'}</button>
+                        </div>
+                    </form>
+                </Modal>
+            )}
+
+            {/* Toast */}
+            {toast && (
+                <div className="toast" role="status">
+                    <span>{toast.message}</span>
+                    {toast.undo && <button onClick={() => { toast.undo(); setToast({ message: 'Restored' }); }}>Undo</button>}
+                </div>
+            )}
         </div>
     );
 }
