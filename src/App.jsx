@@ -65,7 +65,13 @@ const nextRenewalDate = (sub) => {
     return date;
 };
 const daysUntil = (date) => (date ? Math.round((date - startOfToday()) / 86400000) : null);
-const monthlyCostOf = (sub) => (sub.isFreeTrial ? 0 : sub.cycle === 'yearly' ? Number(sub.cost || 0) / 12 : Number(sub.cost || 0));
+const trialHasEnded = (sub) => sub.isFreeTrial && sub.nextRenewalDate && parseLocalDate(sub.nextRenewalDate) < startOfToday();
+// Free trials cost nothing until they end; after that the service is charging you
+const monthlyCostOf = (sub) => {
+    if (sub.isFreeTrial && !trialHasEnded(sub)) return 0;
+    return sub.cycle === 'yearly' ? Number(sub.cost || 0) / 12 : Number(sub.cost || 0);
+};
+const isPermissionError = (error) => String(error?.code || error?.message || '').toUpperCase().includes('PERMISSION_DENIED');
 const whenText = (days) => (days === 0 ? 'Today' : days === 1 ? 'Tomorrow' : `In ${days} days`);
 const markColor = (name = '') => MARK_COLORS[[...name].reduce((a, c) => a + c.charCodeAt(0), 0) % MARK_COLORS.length];
 
@@ -265,6 +271,8 @@ function App() {
     const [toast, setToast] = useState(null); // { message, undo }
     const [editingBudget, setEditingBudget] = useState(false);
     const [budgetDraft, setBudgetDraft] = useState('');
+    const [budgetError, setBudgetError] = useState('');
+    const [limitDrafts, setLimitDrafts] = useState({});
     const [editingLimits, setEditingLimits] = useState(false);
     const [formError, setFormError] = useState('');
 
@@ -307,20 +315,29 @@ function App() {
     useEffect(() => {
         if (!user) return;
         const base = `users/${user.uid}`;
-        const unsubSubs = onValue(ref(db, `${base}/subscriptions`), (s) => setSubscriptions(snapshotToList(s)));
-        const unsubExps = onValue(ref(db, `${base}/expenses`), (s) => setExpenses(snapshotToList(s)));
+        const onLoadError = (what) => (error) => {
+            console.error(`Error loading ${what}:`, error);
+            setToast({
+                error: true,
+                message: isPermissionError(error)
+                    ? `Couldn't load your ${what}: the Firebase database rules are blocking it. Publish the rules from database.rules.json.`
+                    : `Couldn't load your ${what}. Check your internet connection and refresh.`,
+            });
+        };
+        const unsubSubs = onValue(ref(db, `${base}/subscriptions`), (s) => setSubscriptions(snapshotToList(s)), onLoadError('subscriptions'));
+        const unsubExps = onValue(ref(db, `${base}/expenses`), (s) => setExpenses(snapshotToList(s)), onLoadError('expenses'));
         const unsubSettings = onValue(ref(db, `${base}/settings`), (s) => {
             const settings = s.val() || {};
-            if (settings.monthlyBudget != null) setMonthlyBudget(Number(settings.monthlyBudget));
+            setMonthlyBudget(settings.monthlyBudget != null ? Number(settings.monthlyBudget) : 20000);
             setCategoryBudgets(settings.categoryBudgets || {});
-        });
+        }, onLoadError('budget settings'));
         return () => { unsubSubs(); unsubExps(); unsubSettings(); };
     }, [user]);
 
     // --- Toast auto-hide ---
     useEffect(() => {
         if (!toast) return;
-        const timer = setTimeout(() => setToast(null), 6000);
+        const timer = setTimeout(() => setToast(null), toast.error ? 12000 : 6000);
         return () => clearTimeout(timer);
     }, [toast]);
 
@@ -391,18 +408,60 @@ function App() {
     };
     const handleLogout = () => signOut(auth);
 
-    // --- Settings ---
-    const saveBudget = async () => {
-        const value = Number(budgetDraft);
-        if (!value || value <= 0) return;
-        setMonthlyBudget(value);
-        setEditingBudget(false);
-        await set(ref(db, `users/${user.uid}/settings/monthlyBudget`), value);
-        setToast({ message: `Budget set to ${formatINR(value)}` });
+    // --- Errors from database writes ---
+    const showWriteError = (action, error) => {
+        console.error(`Couldn't ${action}:`, error);
+        setToast({
+            error: true,
+            message: isPermissionError(error)
+                ? `Couldn't ${action}: the Firebase database rules are blocking it. Publish the rules from database.rules.json.`
+                : `Couldn't ${action}. Check your internet connection and try again.`,
+        });
     };
-    const saveCategoryBudget = (category, value) => {
+
+    // --- Settings ---
+    const startEditingBudget = () => {
+        setBudgetDraft(String(monthlyBudget));
+        setBudgetError('');
+        setEditingBudget(true);
+    };
+    const saveBudget = async () => {
+        const value = Math.round(Number(budgetDraft));
+        if (!budgetDraft || !Number.isFinite(value) || value <= 0) {
+            setBudgetError('Enter a budget greater than ₹0.');
+            return;
+        }
+        const previous = monthlyBudget;
+        setMonthlyBudget(value); // show it straight away
+        setEditingBudget(false);
+        try {
+            await set(ref(db, `users/${user.uid}/settings/monthlyBudget`), value);
+            setToast({ message: `Monthly budget set to ${formatINR(value)}` });
+        } catch (error) {
+            setMonthlyBudget(previous); // put the old value back if it didn't save
+            showWriteError('save your budget', error);
+        }
+    };
+    const commitCategoryLimit = async (category) => {
+        if (!(category in limitDrafts)) return;
+        const raw = limitDrafts[category];
+        const value = raw === '' ? null : Math.round(Number(raw));
+        setLimitDrafts((prev) => {
+            const rest = { ...prev };
+            delete rest[category];
+            return rest;
+        });
+        if (value !== null && (!Number.isFinite(value) || value < 0)) return;
+        if ((categoryBudgets[category] ?? null) === value) return;
+        const previous = categoryBudgets;
         setCategoryBudgets((prev) => ({ ...prev, [category]: value }));
-        set(ref(db, `users/${user.uid}/settings/categoryBudgets/${category}`), value);
+        try {
+            await set(ref(db, `users/${user.uid}/settings/categoryBudgets/${category}`), value);
+            setToast({ message: value === null ? `${category} limit removed` : `${category} limit set to ${formatINR(value)}` });
+        } catch (error) {
+            setCategoryBudgets(previous);
+            showWriteError(`save the ${category} limit`, error);
+        }
     };
 
     // --- Subscriptions ---
@@ -431,15 +490,19 @@ function App() {
             closeModal();
         } catch (error) {
             console.error('Error saving subscription:', error);
-            setFormError('Couldn\'t save. Check your connection and try again.');
+            setFormError(isPermissionError(error) ? 'Couldn\'t save: the Firebase database rules are blocking it.' : 'Couldn\'t save. Check your internet connection and try again.');
         }
     };
 
     const deleteSubscription = async (sub) => {
         const { id, name, cost, cycle, nextRenewalDate: renewal, isFreeTrial } = sub;
         const path = `users/${user.uid}/subscriptions/${id}`;
-        await remove(ref(db, path));
-        setToast({ message: `${name} deleted`, undo: () => set(ref(db, path), { name, cost, cycle: cycle || 'monthly', nextRenewalDate: renewal || '', isFreeTrial: Boolean(isFreeTrial) }) });
+        try {
+            await remove(ref(db, path));
+            setToast({ message: `${name} deleted`, undo: () => set(ref(db, path), { name, cost, cycle: cycle || 'monthly', nextRenewalDate: renewal || '', isFreeTrial: Boolean(isFreeTrial) }) });
+        } catch (error) {
+            showWriteError(`delete ${name}`, error);
+        }
     };
 
     // --- Expenses ---
@@ -466,15 +529,19 @@ function App() {
             closeModal();
         } catch (error) {
             console.error('Error saving expense:', error);
-            setFormError('Couldn\'t save. Check your connection and try again.');
+            setFormError(isPermissionError(error) ? 'Couldn\'t save: the Firebase database rules are blocking it.' : 'Couldn\'t save. Check your internet connection and try again.');
         }
     };
 
     const deleteExpense = async (exp) => {
         const { id, name, amount, category, date } = exp;
         const path = `users/${user.uid}/expenses/${id}`;
-        await remove(ref(db, path));
-        setToast({ message: `${name} deleted`, undo: () => set(ref(db, path), { name, amount, category: category || 'Other', date: date || todayISO() }) });
+        try {
+            await remove(ref(db, path));
+            setToast({ message: `${name} deleted`, undo: () => set(ref(db, path), { name, amount, category: category || 'Other', date: date || todayISO() }) });
+        } catch (error) {
+            showWriteError(`delete ${name}`, error);
+        }
     };
 
     // --- CSV export ---
@@ -542,23 +609,30 @@ function App() {
                     </div>
                     <div className="meter-legend">
                         <span><span className="key" />Projected {formatINR(projectedSpend)}</span>
-                        <span>
-                            Budget {formatINR(monthlyBudget)}{' '}
-                            {!editingBudget && <button className="link-btn" onClick={() => { setBudgetDraft(String(monthlyBudget)); setEditingBudget(true); }}>Change</button>}
-                        </span>
+                        <span>Budget {formatINR(monthlyBudget)}</span>
                     </div>
-                    {editingBudget && (
+                    {editingBudget ? (
                         <form className="budget-edit" onSubmit={(e) => { e.preventDefault(); saveBudget(); }}>
-                            <input type="number" min="1" autoFocus value={budgetDraft} onChange={(e) => setBudgetDraft(e.target.value)} aria-label="Monthly budget in rupees" />
-                            <button className="btn btn-sm" type="submit">Save</button>
-                            <button className="btn btn-sm btn-ghost" type="button" style={{ color: '#fff' }} onClick={() => setEditingBudget(false)}>Cancel</button>
+                            <label htmlFor="budget-input" className="budget-label">Monthly budget (₹)</label>
+                            <div className="budget-row">
+                                <input id="budget-input" type="number" min="1" step="1" inputMode="numeric" autoFocus value={budgetDraft}
+                                    style={{ color: '#13201d', background: '#fff' }}
+                                    onChange={(e) => { setBudgetDraft(e.target.value); setBudgetError(''); }}
+                                    onKeyDown={(e) => e.key === 'Escape' && setEditingBudget(false)} />
+                                <button className="btn btn-sm" type="submit">Save budget</button>
+                                <button className="btn btn-sm btn-on-dark" type="button" onClick={() => setEditingBudget(false)}>Cancel</button>
+                            </div>
+                            {budgetError && <p className="budget-error" role="alert">{budgetError}</p>}
                         </form>
+                    ) : (
+                        <button className="btn btn-sm btn-on-dark budget-btn" onClick={startEditingBudget}><Icon name="edit" />Edit monthly budget</button>
                     )}
 
                     <div className={`forecast ${overBudgetBy > 0 ? 'over' : 'ok'}`}>
                         {overBudgetBy > 0
                             ? `At this pace you'll spend ${formatINR(projectedSpend)} by ${daysInMonth} ${monthName}, ${formatINR(overBudgetBy)} over budget. Slow down on day-to-day spending to stay on track.`
                             : `At this pace you'll finish the month around ${formatINR(projectedSpend)}, ${formatINR(-overBudgetBy)} under budget.`}
+                        {dayOfMonth < 5 && <span className="forecast-note"> The forecast gets more accurate after the first few days of the month.</span>}
                     </div>
 
                     <div className="mini-stats">
@@ -714,6 +788,7 @@ function App() {
                     <div className="panel-head">
                         <h2>Category budgets</h2>
                         <button className="btn btn-sm" onClick={() => setEditingLimits(!editingLimits)}>{editingLimits ? 'Done' : 'Set limits'}</button>
+                        {editingLimits && <p className="fine" style={{ width: '100%' }}>Type a limit and press Enter, or click outside the box, to save it. Leave it empty for no limit.</p>}
                     </div>
                     <div className="limits">
                         {CATEGORIES.map((c) => {
@@ -730,8 +805,11 @@ function App() {
                                     <div className="bar"><span style={{ width: `${pct}%`, background: over ? '#c23b2e' : pct > 80 ? '#e9a21b' : CATEGORY_COLORS[c] }} /></div>
                                     {over && <div className="limit-note">{formatINR(spent - limit)} over this limit</div>}
                                     {editingLimits && (
-                                        <input className="input input-sm limit-input" type="number" min="0" placeholder="No limit" aria-label={`${c} monthly limit in rupees`}
-                                            value={categoryBudgets[c] ?? ''} onChange={(e) => saveCategoryBudget(c, e.target.value === '' ? null : Number(e.target.value))} />
+                                        <input className="input input-sm limit-input" type="number" min="0" step="1" inputMode="numeric" placeholder="No limit" aria-label={`${c} monthly limit in rupees`}
+                                            value={c in limitDrafts ? limitDrafts[c] : (categoryBudgets[c] ?? '')}
+                                            onChange={(e) => setLimitDrafts((prev) => ({ ...prev, [c]: e.target.value }))}
+                                            onBlur={() => commitCategoryLimit(c)}
+                                            onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()} />
                                     )}
                                 </div>
                             );
@@ -820,9 +898,18 @@ function App() {
 
             {/* Toast */}
             {toast && (
-                <div className="toast" role="status">
+                <div className={`toast${toast.error ? ' error' : ''}`} role={toast.error ? 'alert' : 'status'}>
                     <span>{toast.message}</span>
-                    {toast.undo && <button onClick={() => { toast.undo(); setToast({ message: 'Restored' }); }}>Undo</button>}
+                    {toast.undo && (
+                        <button onClick={async () => {
+                            try {
+                                await toast.undo();
+                                setToast({ message: 'Restored' });
+                            } catch (error) {
+                                showWriteError('restore it', error);
+                            }
+                        }}>Undo</button>
+                    )}
                 </div>
             )}
         </div>
